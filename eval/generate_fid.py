@@ -410,7 +410,8 @@ def generate_images(
 def main():
     parser = argparse.ArgumentParser(description="SiT-XL/2 REPA Flax → generate + FID")
 
-    parser.add_argument("--ckpt-dir",       default="REPA/pretrained_models/flax_ckpt",
+    parser.add_argument("--ckpt-dir",
+                        default="/kaggle/input/models/lucastnguyen/sit-xl2-repa/other/default/1/pretrained_models/flax_ckpt",
                         help="Path to orbax checkpoint directory")
     parser.add_argument("--ref-dir",
                         default="/kaggle/input/competitions/imagenet-object-localization-challenge"
