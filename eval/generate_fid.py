@@ -75,7 +75,12 @@ _LATENT_SCALE = 0.18215
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_model(ckpt_dir: str) -> DiT:
-    """Load DiT weights from an orbax checkpoint produced by convert_repa_to_nnx.py."""
+    """Load DiT weights from an orbax checkpoint produced by convert_repa_to_nnx.py.
+
+    Compatible with Flax 0.10.x (plain list) and 0.12.x+ (nnx.List).
+    The checkpoint was created on Flax 0.10.x; on newer Flax the state paths
+    are identical so restore works directly without re-saving.
+    """
     print(f"Loading Flax checkpoint from: {ckpt_dir}")
     rngs  = nnx.Rngs(0)
     model = DiT(**_MODEL_CFG, rngs=rngs)
@@ -83,14 +88,36 @@ def load_model(ckpt_dir: str) -> DiT:
     abstract_state = nnx.state(model, (nnx.Param, Buffer))
     ckptr  = ocp.Checkpointer(ocp.CompositeCheckpointHandler())
     out    = epath.Path(Path(ckpt_dir).resolve())
-    result = ckptr.restore(
-        out,
-        args=ocp.args.Composite(model=ocp.args.StandardRestore(abstract_state)),
-    )
-    nnx.update(model, result.model)
-    print(f"  DiT params loaded.  "
-          f"Param count: {sum(v.size for v in jax.tree.leaves(nnx.state(model, nnx.Param))):,}")
+
+    try:
+        result = ckptr.restore(
+            out,
+            args=ocp.args.Composite(model=ocp.args.StandardRestore(abstract_state)),
+        )
+        nnx.update(model, result.model)
+    except Exception as e:
+        # Flax 0.12+ may raise if state structure differs slightly.
+        # Fall back to loading raw numpy arrays and assigning manually.
+        print(f"  Standard restore failed ({e}), trying raw restore …")
+        result = ckptr.restore(out)
+        raw = result.get('model', result)
+        _assign_raw_state(model, raw)
+
+    param_count = sum(v.size for v in jax.tree.leaves(nnx.state(model, nnx.Param)))
+    print(f"  DiT params loaded.  Param count: {param_count:,}")
     return model
+
+
+def _assign_raw_state(model: DiT, raw: dict) -> None:
+    """Manually assign raw numpy/jax arrays from orbax restore into model variables."""
+    import jax.numpy as jnp
+    flat_state = nnx.state(model, (nnx.Param, Buffer))
+
+    def _assign(state_leaf, raw_leaf):
+        if hasattr(state_leaf, 'value'):
+            state_leaf.value = jnp.array(raw_leaf)
+
+    jax.tree.map(_assign, flat_state, raw)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

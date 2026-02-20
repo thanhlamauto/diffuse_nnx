@@ -381,8 +381,10 @@ class DiT(nnx.Module):
             num_classes, hidden_size, class_dropout_prob, enable_dropout, dtype=dtype, rngs=rngs
         )
 
-        # nnx.List required for Flax >= 0.12.0 (plain list not allowed for Module children)
-        self.blocks = nnx.List([
+        # Flax >= 0.12.0 requires nnx.List for lists of sub-modules.
+        # Fall back to plain list for older versions that lack nnx.List.
+        _ListCls = getattr(nnx, 'List', list)
+        self.blocks = _ListCls([
             DiTBlock(
                 hidden_size, num_heads, mlp_ratio,
                 dtype=dtype, mlp_dropout=mlp_dropout, attn_dropout=attn_dropout, rngs=rngs
