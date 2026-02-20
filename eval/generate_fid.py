@@ -121,61 +121,99 @@ def _assign_raw_state(model: DiT, raw: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. SDE sampler  (exact JAX port of REPA's euler_maruyama_sampler)
+# 2. SDE sampler  (JIT-compiled via lax.scan — one XLA kernel for all 250 steps)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_score_from_velocity(v: jnp.ndarray, x: jnp.ndarray, t: float) -> jnp.ndarray:
-    """Convert velocity v_t to score ∇ log p_t for the linear path.
-
-    Linear transport: x_t = (1-t)x + t·ε
-        α_t = 1-t,  dα/dt = -1
-        σ_t = t,    dσ/dt =  1
-    => score = (-(1-t)·v - x) / t
-    """
-    ndim_extra = v.ndim - 1
-    t_b = jnp.array(t).reshape((1,) + (1,) * ndim_extra)
-    return (-((1.0 - t_b) * v + x)) / t_b
-
-
-def _model_step(
+def build_sampler(
     model: DiT,
-    x: jnp.ndarray,
-    t_scalar: float,
-    y: jnp.ndarray,
-    y_null: jnp.ndarray,
-    cfg_scale: float,
-    guidance_high: float,
-    guidance_low: float,
-) -> jnp.ndarray:
-    """Evaluate model + CFG, return drift (without diffusion noise term)."""
-    B = x.shape[0]
-    t_vec = jnp.ones(B) * t_scalar
-    use_cfg = cfg_scale > 1.0 and guidance_low <= t_scalar <= guidance_high
+    num_steps: int   = 250,
+    cfg_scale: float = 1.8,
+    guidance_high: float = 0.7,
+    guidance_low: float  = 0.0,
+):
+    """Return a JIT-compiled sampler function.
 
-    if use_cfg:
-        x_in = jnp.concatenate([x, x], axis=0)
-        y_in = jnp.concatenate([y, y_null], axis=0)
-        t_in = jnp.ones(2 * B) * t_scalar
-    else:
-        x_in, y_in, t_in = x, y, t_vec
+    Compiles once on first call; subsequent calls with same batch shape are fast.
 
-    # raw velocity from DiT  (channels-last: (B, H, W, C))
-    v_out, _ = model(x_in, t_in, y_in)
+    Optimisations vs naive Python loop:
+      • Full 250-step loop compiled into a single XLA kernel via jax.lax.scan.
+      • Constant 2B batch throughout (no shape switching → single compilation).
+      • jax.jit eliminates Python dispatch overhead per step.
 
-    diffusion = 2.0 * t_scalar
+    Returns:
+        Callable  sample_fn(x0, y, rng) → latents  (B, H, W, C)
+    """
+    graphdef, model_state = nnx.split(model)
 
-    if use_cfg:
-        v_cond, v_uncond = v_out[:B], v_out[B:]
-        s_cond   = _get_score_from_velocity(v_cond,   x, t_scalar)
-        s_uncond = _get_score_from_velocity(v_uncond,  x, t_scalar)
-        d_cond   = v_cond   - 0.5 * diffusion * s_cond
-        d_uncond = v_uncond - 0.5 * diffusion * s_uncond
-        drift = d_uncond + cfg_scale * (d_cond - d_uncond)
-    else:
-        s     = _get_score_from_velocity(v_out, x, t_scalar)
-        drift = v_out - 0.5 * diffusion * s
+    # Pre-compute time grid as JAX arrays (static for all calls)
+    t_main   = jnp.linspace(1.0, 0.04, num_steps)
+    t_steps  = jnp.concatenate([t_main, jnp.array([0.0])])
+    t_scan   = (t_steps[:-2], t_steps[1:-1])   # pairs fed into lax.scan
+    t_last_cur  = t_steps[-2]
+    t_last_next = t_steps[-1]
 
-    return drift
+    @jax.jit
+    def sample_fn(x0: jnp.ndarray, y: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
+        B = x0.shape[0]
+        y_null = jnp.ones(B, dtype=jnp.int32) * 1000
+
+        # ── inner forward call (captured model state as constant) ──
+        def _fwd(x_in, t_in, y_in):
+            mdl = nnx.merge(graphdef, model_state)
+            v, _ = mdl(x_in, t_in, y_in)
+            return v
+
+        def _drift(x, v_cond, v_uncond, t_cur):
+            """CFG drift; uses jnp.where so shape is always constant."""
+            diffusion = 2.0 * t_cur
+            ndim = x.ndim - 1
+            t_b = jnp.reshape(jnp.full(B, t_cur), (B,) + (1,) * ndim)
+
+            s_c = -((1.0 - t_b) * v_cond   + x) / t_b
+            s_u = -((1.0 - t_b) * v_uncond + x) / t_b
+            d_c = v_cond   - 0.5 * diffusion * s_c
+            d_u = v_uncond - 0.5 * diffusion * s_u
+
+            # CFG only inside [guidance_low, guidance_high]
+            apply_cfg = jnp.logical_and(t_cur <= guidance_high,
+                                        t_cur >= guidance_low)
+            d_guided = d_u + cfg_scale * (d_c - d_u)
+            return jnp.where(apply_cfg, d_guided, d_c)
+
+        def step(carry, pair):
+            """One Euler-Maruyama step."""
+            x, rng = carry
+            t_cur, t_next = pair
+            dt = t_next - t_cur
+
+            # Always use 2B batch → single JIT compilation path
+            v = _fwd(
+                jnp.concatenate([x, x], axis=0),
+                jnp.full(2 * B, t_cur),
+                jnp.concatenate([y, y_null], axis=0),
+            )
+            drift = _drift(x, v[:B], v[B:], t_cur)
+
+            rng, k = jax.random.split(rng)
+            eps    = jax.random.normal(k, x.shape)
+            x_next = (x
+                      + drift * dt
+                      + jnp.sqrt(jnp.abs(2.0 * t_cur)) * eps * jnp.sqrt(jnp.abs(dt)))
+            return (x_next, rng), None
+
+        # ── 249 stochastic steps compiled into one XLA kernel ──
+        (x, _), _ = jax.lax.scan(step, (x0, rng), t_scan)
+
+        # ── deterministic last step ──
+        v     = _fwd(
+            jnp.concatenate([x, x], axis=0),
+            jnp.full(2 * B, t_last_cur),
+            jnp.concatenate([y, y_null], axis=0),
+        )
+        drift = _drift(x, v[:B], v[B:], t_last_cur)
+        return x + drift * (t_last_next - t_last_cur)
+
+    return sample_fn
 
 
 def euler_maruyama_sample(
@@ -184,48 +222,24 @@ def euler_maruyama_sample(
     y: jnp.ndarray,
     *,
     rng: jnp.ndarray,
-    num_steps: int = 250,
+    num_steps: int   = 250,
     cfg_scale: float = 1.8,
     guidance_high: float = 0.7,
-    guidance_low: float = 0.0,
+    guidance_low: float  = 0.0,
+    _sampler_cache: dict = {},
 ) -> jnp.ndarray:
-    """Stochastic Euler-Maruyama sampler, JAX port of REPA's euler_maruyama_sampler.
-
-    Returns latents of shape `shape` (channels-last, B×H×W×C).
-    """
-    rng, init_key = jax.random.split(rng)
-    x = jax.random.normal(init_key, shape)          # start from Gaussian noise
-
-    y_null = jnp.ones(shape[0], dtype=jnp.int32) * 1000  # null class for CFG
-
-    # time grid: [1.0, ..., 0.04] then append 0.0   (same as REPA)
-    t_main  = np.linspace(1.0, 0.04, num_steps, dtype=np.float64)
-    t_steps = np.concatenate([t_main, [0.0]])
-
-    # ── stochastic steps (all but last) ──
-    for i in range(len(t_steps) - 2):
-        t_cur  = float(t_steps[i])
-        t_next = float(t_steps[i + 1])
-        dt     = t_next - t_cur
-        diffusion = 2.0 * t_cur
-
-        drift = _model_step(
-            model, x, t_cur, y, y_null, cfg_scale, guidance_high, guidance_low
+    """Convenience wrapper — builds (and caches) the JIT-compiled sampler on first call."""
+    cache_key = (id(model), num_steps, cfg_scale, guidance_high, guidance_low)
+    if cache_key not in _sampler_cache:
+        print("  [sampler] Compiling JIT sampler (first call only) …")
+        _sampler_cache[cache_key] = build_sampler(
+            model, num_steps, cfg_scale, guidance_high, guidance_low
         )
-        rng, noise_key = jax.random.split(rng)
-        eps  = jax.random.normal(noise_key, x.shape)
-        x    = x + drift * dt + math.sqrt(diffusion) * eps * math.sqrt(abs(dt))
+    fn = _sampler_cache[cache_key]
 
-    # ── deterministic last step (returns conditional mean) ──
-    t_cur  = float(t_steps[-2])
-    t_next = float(t_steps[-1])
-    dt     = t_next - t_cur
-    drift  = _model_step(
-        model, x, t_cur, y, y_null, cfg_scale, guidance_high, guidance_low
-    )
-    x = x + drift * dt
-
-    return x
+    rng, init_key = jax.random.split(rng)
+    x0 = jax.random.normal(init_key, shape)
+    return fn(x0, y, rng)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
