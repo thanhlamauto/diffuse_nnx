@@ -178,3 +178,7 @@ wandb/
 
 .env.*
 jmt/
+
+# REPA: embedded repo + large weights (upload weights to Kaggle Dataset)
+REPA/
+REPA/pretrained_models/
