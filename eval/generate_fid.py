@@ -133,38 +133,41 @@ def build_sampler(
 ):
     """Return a JIT-compiled sampler function.
 
-    Compiles once on first call; subsequent calls with same batch shape are fast.
-
-    Optimisations vs naive Python loop:
-      • Full 250-step loop compiled into a single XLA kernel via jax.lax.scan.
-      • Constant 2B batch throughout (no shape switching → single compilation).
-      • jax.jit eliminates Python dispatch overhead per step.
+    Key design decisions:
+      • model_state is passed as a JIT *argument* (not a closure) so XLA
+        treats weights as normal HBM tensors rather than 2.7 GB literal
+        constants — avoids the "captured constants" warning and runs faster.
+      • Full 250-step loop is a single jax.lax.scan → one XLA kernel.
+      • Constant 2B batch (CFG-concatenated) → single JIT compilation shape.
 
     Returns:
         Callable  sample_fn(x0, y, rng) → latents  (B, H, W, C)
     """
     graphdef, model_state = nnx.split(model)
 
-    # Pre-compute time grid as JAX arrays (static for all calls)
-    t_main   = jnp.linspace(1.0, 0.04, num_steps)
-    t_steps  = jnp.concatenate([t_main, jnp.array([0.0])])
-    t_scan   = (t_steps[:-2], t_steps[1:-1])   # pairs fed into lax.scan
-    t_last_cur  = t_steps[-2]
-    t_last_next = t_steps[-1]
+    # Pre-compute time grid once (numpy — not JAX, avoids tracing overhead)
+    import numpy as _np
+    t_main  = _np.linspace(1.0, 0.04, num_steps, dtype=_np.float32)
+    t_steps = _np.concatenate([t_main, [0.0]]).astype(_np.float32)
 
+    t_scan_cur  = jnp.array(t_steps[:-2])   # (num_steps-1,) fed to lax.scan
+    t_scan_next = jnp.array(t_steps[1:-1])
+    t_last_cur  = float(t_steps[-2])
+    t_last_next = float(t_steps[-1])
+
+    # ── inner JIT: model_state is an explicit argument, NOT a closure ──
+    # This prevents XLA from embedding 2.7 GB as literal constants.
     @jax.jit
-    def sample_fn(x0: jnp.ndarray, y: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
+    def _inner(model_state, x0: jnp.ndarray, y: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
         B = x0.shape[0]
         y_null = jnp.ones(B, dtype=jnp.int32) * 1000
 
-        # ── inner forward call (captured model state as constant) ──
         def _fwd(x_in, t_in, y_in):
             mdl = nnx.merge(graphdef, model_state)
             v, _ = mdl(x_in, t_in, y_in)
             return v
 
         def _drift(x, v_cond, v_uncond, t_cur):
-            """CFG drift; uses jnp.where so shape is always constant."""
             diffusion = 2.0 * t_cur
             ndim = x.ndim - 1
             t_b = jnp.reshape(jnp.full(B, t_cur), (B,) + (1,) * ndim)
@@ -174,19 +177,16 @@ def build_sampler(
             d_c = v_cond   - 0.5 * diffusion * s_c
             d_u = v_uncond - 0.5 * diffusion * s_u
 
-            # CFG only inside [guidance_low, guidance_high]
             apply_cfg = jnp.logical_and(t_cur <= guidance_high,
                                         t_cur >= guidance_low)
             d_guided = d_u + cfg_scale * (d_c - d_u)
             return jnp.where(apply_cfg, d_guided, d_c)
 
         def step(carry, pair):
-            """One Euler-Maruyama step."""
             x, rng = carry
             t_cur, t_next = pair
             dt = t_next - t_cur
 
-            # Always use 2B batch → single JIT compilation path
             v = _fwd(
                 jnp.concatenate([x, x], axis=0),
                 jnp.full(2 * B, t_cur),
@@ -201,10 +201,10 @@ def build_sampler(
                       + jnp.sqrt(jnp.abs(2.0 * t_cur)) * eps * jnp.sqrt(jnp.abs(dt)))
             return (x_next, rng), None
 
-        # ── 249 stochastic steps compiled into one XLA kernel ──
-        (x, _), _ = jax.lax.scan(step, (x0, rng), t_scan)
+        # 249 stochastic steps → single XLA scan kernel
+        (x, _), _ = jax.lax.scan(step, (x0, rng), (t_scan_cur, t_scan_next))
 
-        # ── deterministic last step ──
+        # deterministic last step
         v     = _fwd(
             jnp.concatenate([x, x], axis=0),
             jnp.full(2 * B, t_last_cur),
@@ -212,6 +212,9 @@ def build_sampler(
         )
         drift = _drift(x, v[:B], v[B:], t_last_cur)
         return x + drift * (t_last_next - t_last_cur)
+
+    def sample_fn(x0: jnp.ndarray, y: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
+        return _inner(model_state, x0, y, rng)
 
     return sample_fn
 
@@ -256,17 +259,29 @@ def load_vae(vae_name: str = "stabilityai/sd-vae-ft-ema") -> AutoencoderKL:
 
 
 @torch.no_grad()
-def decode_latents(vae: AutoencoderKL, latents_jax: jnp.ndarray) -> np.ndarray:
-    """Decode a batch of JAX latents (B,H,W,C channels-last) → uint8 RGB (B,H,W,3)."""
+def decode_latents(vae: AutoencoderKL, latents_jax: jnp.ndarray,
+                   vae_batch: int = 8) -> np.ndarray:
+    """Decode a batch of JAX latents (B,H,W,C channels-last) → uint8 RGB (B,H,W,3).
+
+    Explicit block_until_ready() syncs the TPU before we copy to CPU,
+    avoiding hangs caused by JAX/TPU async + PyTorch interaction.
+    Decodes in mini-batches of `vae_batch` to keep CPU RAM manageable.
+    """
+    # Sync TPU → CPU transfer before touching numpy
+    latents_jax.block_until_ready()
+    lat_np = np.array(latents_jax)             # (B, H, W, C) — safe after sync
+
     device = next(vae.parameters()).device
-    # JAX channels-last → PyTorch channels-first
-    lat = np.asarray(latents_jax)              # (B, H, W, C)
-    lat = torch.from_numpy(lat).permute(0, 3, 1, 2).float().to(device)  # (B,C,H,W)
-    lat = lat / _LATENT_SCALE                  # undo REPA's normalisation
-    images = vae.decode(lat).sample            # (B, 3, H, W) in [-1, 1]
-    images = (images / 2 + 0.5).clamp(0, 1)   # [0, 1]
-    images = (images * 255).byte().permute(0, 2, 3, 1).cpu().numpy()  # (B,H,W,3) uint8
-    return images
+    out_parts = []
+    for i in range(0, len(lat_np), vae_batch):
+        chunk = lat_np[i : i + vae_batch]
+        lat_t = torch.from_numpy(chunk.copy()).permute(0, 3, 1, 2).float().to(device)
+        lat_t = lat_t / _LATENT_SCALE
+        imgs  = vae.decode(lat_t).sample
+        imgs  = (imgs / 2 + 0.5).clamp(0, 1)
+        imgs  = (imgs * 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        out_parts.append(imgs)
+    return np.concatenate(out_parts, axis=0)   # (B, H, W, 3) uint8
 
 
 # ─────────────────────────────────────────────────────────────────────────────
