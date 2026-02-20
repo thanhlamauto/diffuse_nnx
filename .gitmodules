@@ -1,0 +1,3 @@
+[submodule "DomainGuidance"]
+	path = DomainGuidance
+	url = https://github.com/thuml/DomainGuidance.git
