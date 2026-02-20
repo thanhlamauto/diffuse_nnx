@@ -381,13 +381,13 @@ class DiT(nnx.Module):
             num_classes, hidden_size, class_dropout_prob, enable_dropout, dtype=dtype, rngs=rngs
         )
 
-        # consider using scan
-        self.blocks = [
+        # nnx.List required for Flax >= 0.12.0 (plain list not allowed for Module children)
+        self.blocks = nnx.List([
             DiTBlock(
                 hidden_size, num_heads, mlp_ratio,
                 dtype=dtype, mlp_dropout=mlp_dropout, attn_dropout=attn_dropout, rngs=rngs
             ) for _ in range(depth)
-        ]
+        ])
 
         self.final_layer = FinalLayer(
             hidden_size, patch_size, self.out_channels, dtype=dtype, rngs=rngs
